@@ -14,8 +14,14 @@ fullscreen = 0
 android.permissions = INTERNET
 android.api = 33
 android.minapi = 24
+android.ndk = 25b
+android.ndk_api = 24
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
+
+# Bewaehrte Toolchain-Version festnageln (neueres p4a nutzt Python 3.14,
+# mit dem Kivy 2.3.0 nicht baut)
+p4a.branch = v2024.01.21
 
 [buildozer]
 log_level = 2
