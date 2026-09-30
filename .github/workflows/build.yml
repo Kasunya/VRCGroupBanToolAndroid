@@ -7,20 +7,37 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with:
-          command: buildozer android debug
-          buildozer_version: stable
+          python-version: "3.11"
 
-      - name: Upload APK
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Systempakete installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev libltdl-dev \
+            build-essential ccache
+
+      - name: Buildozer installieren
+        run: pip install --upgrade pip setuptools virtualenv buildozer "cython<3"
+
+      - name: APK bauen
+        run: buildozer -v android debug
+
+      - name: APK hochladen
         uses: actions/upload-artifact@v4
         with:
           name: vrchat-group-ban-apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
