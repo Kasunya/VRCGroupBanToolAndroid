@@ -1,5 +1,6 @@
 """VRChat Group Bulk-Ban - Android app (Kivy)."""
 import base64
+import json
 import os
 import re
 import threading
@@ -17,6 +18,7 @@ except Exception:
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
@@ -27,10 +29,15 @@ from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.utils import platform
 
 API = "https://api.vrchat.cloud/api/1"
 USER_AGENT = "GroupBanTool/1.0 (your-discord-or-email)"  # add a contact here
 DELAY = 1.5  # seconds between requests (rate limit)
+
+FOLDER_NAME = "VRChatGroupBan"  # reports are saved to Download/VRChatGroupBan
+HISTORY_LIMIT = 500  # how many bans the in-app history keeps
+HISTORY_SHOWN = 100  # how many bans the history window shows
 
 RED = (1, 0.4, 0.4, 1)
 GREEN = (0.5, 0.9, 0.5, 1)
@@ -63,6 +70,65 @@ def parse_names(text):
     return list(dict.fromkeys(names))
 
 
+def now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def write_text_file(folder, filename, text):
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def save_report(filename, text):
+    """Save a text file where the user can easily find it.
+
+    Android: Download/VRChatGroupBan/ (via MediaStore, no permission needed).
+    Fallback: the app's own folder on shared storage.
+    Other systems: ~/Downloads/VRChatGroupBan/.
+    Returns (ok, location_or_error).
+    """
+    if platform == "android":
+        first_error = ""
+        try:
+            from jnius import autoclass
+
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            ContentValues = autoclass("android.content.ContentValues")
+            Downloads = autoclass("android.provider.MediaStore$Downloads")
+            resolver = activity.getContentResolver()
+            values = ContentValues()
+            values.put("_display_name", filename)
+            values.put("mime_type", "text/plain")
+            values.put("relative_path", f"Download/{FOLDER_NAME}")
+            uri = resolver.insert(Downloads.EXTERNAL_CONTENT_URI, values)
+            if uri is None:
+                raise RuntimeError("could not create file in Downloads")
+            stream = resolver.openOutputStream(uri)
+            writer = autoclass("java.io.OutputStreamWriter")(stream, "UTF-8")
+            writer.write(text)
+            writer.flush()
+            writer.close()
+            return True, f"Download/{FOLDER_NAME}/{filename}"
+        except Exception as e:
+            first_error = str(e)
+        try:
+            from jnius import autoclass
+
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+            base = activity.getExternalFilesDir(None).getAbsolutePath()
+            return True, write_text_file(base, filename, text)
+        except Exception as e:
+            return False, f"{first_error} / {e}"
+    try:
+        folder = os.path.join(os.path.expanduser("~"), "Downloads", FOLDER_NAME)
+        return True, write_text_file(folder, filename, text)
+    except Exception as e:
+        return False, str(e)
+
+
 class BanApp(App):
     title = "VRChat Group Ban"
 
@@ -74,6 +140,7 @@ class BanApp(App):
         self.logged_in = False
         self.running = False
         self.stop_event = threading.Event()
+        self.history_lock = threading.Lock()
         self.log_lines = []
 
         scroll = ScrollView(do_scroll_x=False)
@@ -159,6 +226,15 @@ class BanApp(App):
         self.log_lb.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
         self.log_scroll.add_widget(self.log_lb)
         root.add_widget(self.log_scroll)
+
+        tools = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        self.copy_btn = Button(text="Copy logs")
+        self.copy_btn.bind(on_release=self.copy_logs)
+        self.history_btn = Button(text="Ban history")
+        self.history_btn.bind(on_release=self.show_history)
+        tools.add_widget(self.copy_btn)
+        tools.add_widget(self.history_btn)
+        root.add_widget(tools)
         return scroll
 
     def on_start(self):
@@ -173,12 +249,12 @@ class BanApp(App):
         lb.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
         sv.add_widget(lb)
         box.add_widget(sv)
-        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        accept = Button(text="I understand and accept")
-        leave = Button(text="Exit", background_color=(0.8, 0.25, 0.25, 1))
-        row.add_widget(accept)
-        row.add_widget(leave)
-        box.add_widget(row)
+        accept = Button(text="I understand and accept", size_hint_y=None, height=dp(52))
+        leave = Button(
+            text="Exit", size_hint_y=None, height=dp(48), background_color=(0.8, 0.25, 0.25, 1)
+        )
+        box.add_widget(accept)
+        box.add_widget(leave)
         pop = Popup(
             title=DISCLAIMER_TITLE,
             title_color=RED,
@@ -222,6 +298,11 @@ class BanApp(App):
         n = len(parse_names(self.names_in.text))
         self.count_lb.text = f"{n} {'entry' if n == 1 else 'entries'}"
 
+    def flash(self, button, message, base_text):
+        """Show a short message on a button, then restore its label."""
+        button.text = message
+        Clock.schedule_once(lambda dt: setattr(button, "text", base_text), 1.5)
+
     def popup(self, title, text, on_yes=None, with_input=False):
         box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
         box.add_widget(Label(text=text))
@@ -260,6 +341,96 @@ class BanApp(App):
                 continue
             return r
         return r
+
+    # ---------------- logs & ban history ----------------
+    def copy_logs(self, *_):
+        text = "\n".join(self.log_lines)
+        if not text:
+            self.flash(self.copy_btn, "Nothing to copy", "Copy logs")
+            return
+        Clipboard.copy(text)
+        self.flash(self.copy_btn, "Copied!", "Copy logs")
+
+    def history_path(self):
+        return os.path.join(self.user_data_dir, "ban_history.json")
+
+    def load_history(self):
+        try:
+            with open(self.history_path(), encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def add_history(self, entry):
+        with self.history_lock:
+            data = self.load_history()
+            data.append(entry)
+            data = data[-HISTORY_LIMIT:]
+            try:
+                with open(self.history_path(), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+            except Exception as e:
+                self.log(f"  Could not save ban history: {e}")
+
+    def history_text(self):
+        data = self.load_history()
+        if not data:
+            return "No bans recorded yet."
+        lines = [
+            f"{e.get('time', '')}  {e.get('name', '')}  ({e.get('id', '')})  [{e.get('group', '')}]"
+            for e in reversed(data[-HISTORY_SHOWN:])
+        ]
+        return "\n".join(lines)
+
+    def show_history(self, *_):
+        text = self.history_text()
+        box = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(10))
+        info = Label(
+            text=f"Last bans, newest first.\nReports are saved in: Download/{FOLDER_NAME}",
+            size_hint_y=None,
+            height=dp(56),
+            halign="left",
+            valign="middle",
+        )
+        info.bind(size=lambda w, s: setattr(w, "text_size", s))
+        box.add_widget(info)
+        sv = ScrollView(do_scroll_x=False)
+        lb = Label(text=text, size_hint_y=None, halign="left", valign="top")
+        lb.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
+        lb.bind(texture_size=lambda w, ts: setattr(w, "height", ts[1]))
+        sv.add_widget(lb)
+        box.add_widget(sv)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        copy = Button(text="Copy")
+        close = Button(text="Close")
+        row.add_widget(copy)
+        row.add_widget(close)
+        box.add_widget(row)
+        pop = Popup(title="Ban history", content=box, size_hint=(0.94, 0.9), auto_dismiss=False)
+
+        def _copy(*_):
+            Clipboard.copy(text)
+            self.flash(copy, "Copied!", "Copy")
+
+        copy.bind(on_release=_copy)
+        close.bind(on_release=lambda *_: pop.dismiss())
+        pop.open()
+
+    def build_report(self, group, stamp, banned_list, missing, errors):
+        lines = [
+            "VRChat Group Ban - report",
+            f"Date:  {stamp}",
+            f"Group: {group}",
+            "",
+            f"Banned ({len(banned_list)}):",
+        ]
+        lines += [f"  {n} ({u})" for n, u in banned_list] or ["  -"]
+        lines += ["", f"Not found ({len(missing)}):"]
+        lines += [f"  {n}" for n in missing] or ["  -"]
+        lines += ["", f"Failed ({len(errors)}):"]
+        lines += [f"  {n}" for n in errors] or ["  -"]
+        return "\n".join(lines) + "\n"
 
     # ---------------- login ----------------
     def login(self, *_):
@@ -370,8 +541,8 @@ class BanApp(App):
         return None, None
 
     def worker(self, names, group, dry):
-        banned = failed = 0
-        missing, errors = [], []
+        banned_list, missing, errors = [], [], []
+        started = now_str()
         try:
             for i, name in enumerate(names, 1):
                 if self.stop_event.is_set():
@@ -389,20 +560,27 @@ class BanApp(App):
                     time.sleep(DELAY)
                     if r.status_code == 200:
                         self.log(f"  -> banned: {shown}")
-                        banned += 1
+                        banned_list.append((shown, uid))
+                        self.add_history(
+                            {"time": now_str(), "name": shown, "id": uid, "group": group}
+                        )
                     else:
                         self.log(f"  -> error {r.status_code}: {r.text[:120]}")
-                        failed += 1
                         errors.append(name)
                 self.ui(self.set_progress, i)
         except requests.RequestException as e:
             self.log(f"Network error: {e}")
         self.log("--- Summary ---")
-        self.log(f"Banned: {banned} | Not found: {len(missing)} | Failed: {failed}")
+        self.log(f"Banned: {len(banned_list)} | Not found: {len(missing)} | Failed: {len(errors)}")
         if missing:
             self.log("Not found: " + ", ".join(missing))
         if errors:
             self.log("Failed: " + ", ".join(errors))
+        if not dry and (banned_list or missing or errors):
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            report = self.build_report(group, started, banned_list, missing, errors)
+            ok, where = save_report(f"ban_report_{stamp}.txt", report)
+            self.log(f"Report saved: {where}" if ok else f"Could not save report: {where}")
         self.ui(self.set_running, False)
 
 
