@@ -4,7 +4,7 @@ package.name = vrchatgroupban
 package.domain = org.vrcban
 source.dir = .
 source.include_exts = py,png
-version = 1.0
+version = 1.1
 
 icon.filename = %(source.dir)s/icon.png
 
